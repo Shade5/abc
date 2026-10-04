@@ -155,3 +155,111 @@ CUDA_VISIBLE_DEVICES=0 uv run deploy/serve_policy.py \
     --policy.prompt='throw plastic bottles in bin' \
     --policy.fast-inference
 ```
+
+### Adamo server for a robot streamed over Adamo
+
+`deploy/adamo_server.py` is a FastAPI server that drives a robot streamed over
+[Adamo](https://docs.adamohq.com) (for example the `abc-sim` bottles-in-bin sim). It
+decodes the robot's camera tracks and reads its joint state, runs the fast
+policy with RTC, and publishes 14-D joint targets at 30 Hz as JointState JSON on
+`{robot}/control/joint_state`.
+
+On a fresh node, after the install and checkpoint steps above:
+
+```bash
+# GStreamer, which the adamo SDK links against and decodes video with
+# (appsrc ! h264parse ! avdec_h264). uv can't install it: GStreamer's PyPI
+# wheels are macOS and Windows only.
+sudo apt-get install -y --no-install-recommends \
+    gstreamer1.0-plugins-base gstreamer1.0-plugins-bad gstreamer1.0-libav
+
+uv sync --extra adamo   # adamo==0.4.59, fastapi, uvicorn
+export ADAMO_API_KEY=ak_...   # optional; /start can take the key instead
+uv run deploy/adamo_server.py --policy.checkpoint-path=cache/bottles_75k.pt --port 8000
+```
+
+The server compiles the policy at startup, about 13 minutes on a 3090.
+`--engine-path` keeps the compiled policy in one file, so later starts skip
+the compile: when the file exists it is loaded first, otherwise it is written
+after compiling. Engines are specific to the GPU model and the torch version,
+so keep one per GPU, for example on a shared volume:
+
+```bash
+uv run deploy/adamo_server.py --policy.checkpoint-path=cache/bottles_75k.pt \
+    --engine-path /workspace/abc/3090/engine.bin   # 541 MB; 2 min startup instead of 13
+```
+
+`GET /status` reports `"policy": "ready"` when it's done. Then:
+
+```bash
+curl -X POST localhost:8000/start -H 'content-type: application/json' \
+    -d '{"robot_name": "abc-sim"}'
+curl localhost:8000/status               # cameras, state, inference latency, control
+curl -X POST localhost:8000/take_control  # reclaim after an operator took over
+curl -X POST localhost:8000/stop          # release control and disconnect
+```
+
+`/start` takes `adamo_api_key` (defaults to `$ADAMO_API_KEY`), `robot_name`, and
+optionally `prompt` and the camera track names `head`, `wrist_left`, `wrist_right`
+(those are the defaults; `head` is a side-by-side stereo pair whose left view is the
+policy's `top` camera, set `head_stereo: false` otherwise). It claims the robot as
+an Adamo operator, sending `acquired`, then a heartbeat every second on
+`{robot}/control/json/operator_control`. If another operator acquires the robot,
+the policy stops sending actions until `/take_control`. `GET /topics` lists every
+key the robot publishes on.
+
+The adamo SDK is pinned to 0.4.59 because 1.0 has no API to publish arbitrary
+topics or receive video.
+
+#### On RunPod
+
+1. Deploy an RTX 3090 pod (Secure Cloud) from the console with the image
+   `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` and at least 30 GB of
+   container disk. To reuse a compiled engine across pods, attach a
+   [global volume](https://docs.runpod.io/storage/globalvolume/overview): it mounts
+   at `/workspace` and holds `abc/3090/engine.bin`. Global volumes can only be
+   attached from the console for now, not from the API or `runpodctl`. Keep the
+   default `8888/http` port, which RunPod serves at
+   `https://<pod-id>-8888.proxy.runpod.net`. Adding a port later restarts the pod
+   and wipes its container disk.
+
+2. SSH in and install. The repo, venv and checkpoint live on the container disk,
+   so a pod restart means running this again:
+
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH=$HOME/.local/bin:$PATH
+   apt-get update && apt-get install -y ffmpeg libegl1 libgl1
+   apt-get install -y --no-install-recommends \
+       gstreamer1.0-plugins-base gstreamer1.0-plugins-bad gstreamer1.0-libav
+   git clone https://github.com/Shade5/abc.git && cd abc
+   uv python pin 3.12 && uv sync --extra adamo
+   ABC_CACHE=/root/cache uv run prepare.py --checkpoint
+   ```
+
+3. Serve on 8888 in place of Jupyter. The first run on a new GPU type compiles
+   for about 13 minutes and writes the engine; later pods load it in about 2:
+
+   ```bash
+   pkill -f jupyter-lab
+   setsid nohup uv run deploy/adamo_server.py \
+       --policy.checkpoint-path=/root/cache/bottles_75k.pt \
+       --engine-path /workspace/abc/3090/engine.bin --port 8888 \
+       > /root/server.log 2>&1 < /dev/null &
+   ```
+
+4. From any machine, once `/status` says `ready`:
+
+   ```bash
+   curl https://<pod-id>-8888.proxy.runpod.net/status
+   curl -X POST https://<pod-id>-8888.proxy.runpod.net/start \
+       -H 'content-type: application/json' \
+       -d '{"adamo_api_key": "ak_...", "robot_name": "abc-sim"}'
+   curl -X POST https://<pod-id>-8888.proxy.runpod.net/stop
+   ```
+
+The proxy URL has no authentication, so anyone with it can start and stop runs.
+They still need their own Adamo key to send actions, unless `ADAMO_API_KEY` is set
+in the server's environment. To keep the server private, leave it on port 8000
+and forward the port over the pod's direct SSH (the `ssh.runpod.io` proxy doesn't
+forward ports):
+`ssh -N -L 8000:localhost:8000 root@<pod-ip> -p <pod-ssh-port>`.
