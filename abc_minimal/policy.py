@@ -18,6 +18,7 @@ from abc_minimal.config import (
     validate_vla_checkpoint_config,
 )
 from abc_minimal.dit import CLIPTextEmbedder, DiTPolicy, load_pretrained
+from abc_minimal.fast_dit import FusedDiTSampler
 from abc_minimal.preprocess import (
     normalize,
     parse_norm_stats,
@@ -184,6 +185,8 @@ class DiTInferencePolicy(InferencePolicy):
 
     fast_rtc_warmup_replays = 8  # compiled samplers are graph-replayed
     fast_inference_replay_warmups = 24
+    # Fast inference compiles FusedDiTSampler; False compiles the stock sampler.
+    fused_sampler = True
 
     def __init__(self, checkpoint: Path, config: Any, device: str, model_config: Any = None):
         self.config = config
@@ -220,6 +223,16 @@ class DiTInferencePolicy(InferencePolicy):
         compile_kwargs: dict[str, Any] = {"dynamic": False, "fullgraph": True}
         if compile_mode:
             compile_kwargs["mode"] = compile_mode
+        if self.fused_sampler:
+            # The fused sampler hoists the step-invariant adaLN and cross-attention
+            # K/V GEMMs out of the Euler loop (see fast_dit.py); same math. One
+            # compiled step serves every Euler step, so compiling stays short.
+            sampler = FusedDiTSampler(self.model)
+            sampler.prepare = torch.compile(sampler.prepare, **compile_kwargs)
+            sampler.step = torch.compile(sampler.step, **compile_kwargs)
+            self.model.sample_actions = sampler.sample_actions
+            self.model.sample_actions_rtc = sampler.sample_actions_rtc
+            return
         self.model.sample_actions = torch.compile(
             self.model.sample_actions, **compile_kwargs
         )
