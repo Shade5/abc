@@ -274,6 +274,51 @@ Any catalogue task is selected by name with `--task`. The task list, eval
 flags, prompt defaults, and the released checkpoints' expected numbers are all
 documented in the [abc_sim README](abc_sim/README.md#sim-eval).
 
+## Fast DiT inference
+
+With fast inference on (the default for `eval_policy.py` and `viz_policy.py`,
+`--fast-inference` for deployment), the DiT policy casts to bf16 and compiles a
+fused sampler (`abc_minimal/fast_dit.py`). At batch 1 the sampler is bound by
+reading weights, and the stock Euler loop re-reads two sets of them on every
+step although their inputs never change across steps:
+
+- **adaLN modulations** depend only on (state, task, t), and the t schedule is
+  fixed, so all 32 blocks' modulations for all 10 steps (plus the t = 0 row
+  that RTC prefix positions use) come out of one GEMM per inference.
+- **Cross-attention K/V** depend only on the vision tokens, so all 32 blocks'
+  K/V come out of one GEMM per inference.
+
+Each step then runs only the self-attention, the cross-attention query/output
+projections and the MLP, about 40% fewer weight reads. The math is unchanged
+(it matches the stock sampler to fp32 rounding), and one compiled step is
+reused for every Euler step, so compiling is also shorter. Set
+`DiTInferencePolicy.fused_sampler = False` to compile the stock sampler instead.
+
+RTX 3090, `bottles_75k.pt`, one rendered sim observation (3 cameras at
+168x224), RTC prefix of 4, 10 steps; mean `infer()` latency per action chunk,
+numpy observation in and actions out:
+
+| Configuration | Latency | Speedup | Max action diff vs fp32 | Compile + warmup |
+| --- | ---: | ---: | ---: | ---: |
+| Eager fp32 (`--no-fast-inference`) | 184.4 ms | 1.0x | — | — |
+| Stock fast inference (bf16, compiled sampler) | 70.4 ms | 2.6x | 0.020 std | 832 s |
+| **Fused fast inference (default)** | **49.0 ms** | **3.8x** | 0.019 std | 541 s |
+
+Action differences are in units of the per-dimension action std; both bf16
+paths are equally close to fp32. An NVIDIA L4 is about 2.5x slower than the
+3090 here (408 ms eager, 184 ms stock fast), since it has about a third of the
+memory bandwidth. Reproduce with:
+
+```bash
+uv run scripts/bench_inference.py --mode eager   # fp32 reference actions
+uv run scripts/bench_inference.py --mode stock
+uv run scripts/bench_inference.py --mode fused
+```
+
+The fused sampler reaches about half the 3090's memory bandwidth, so capturing
+the whole sampler in one CUDA graph, and int8 weight-only quantization (which
+changes the numerics and needs an accuracy check), are the next steps.
+
 ## Real-robot deployment
 
 The deployment stack, including RTC, teleoperation, and recording, is
