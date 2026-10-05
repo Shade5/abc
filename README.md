@@ -160,20 +160,20 @@ CUDA_VISIBLE_DEVICES=0 uv run deploy/serve_policy.py \
 
 `deploy/adamo_server.py` is a FastAPI server that drives a robot streamed over
 [Adamo](https://docs.adamohq.com) (for example the `abc-sim` bottles-in-bin sim). It
-decodes the robot's camera tracks and reads its joint state, runs the fast
-policy with RTC, and publishes 14-D joint targets at 30 Hz as JointState JSON on
-`{robot}/control/joint_state`.
+decodes the robot's camera tracks and reads its joint state (`{robot}/state/joints`),
+runs the fast policy with RTC, and publishes 14-D joint targets at 30 Hz as
+JointState JSON on `{robot}/control/joint_state`. The robot must run adamo 1.0 or
+later: adamo 1.0's video receiver can't decode a 0.4 robot's video.
 
 On a fresh node, after the install and checkpoint steps above:
 
 ```bash
-# GStreamer, which the adamo SDK links against and decodes video with
-# (appsrc ! h264parse ! avdec_h264). uv can't install it: GStreamer's PyPI
-# wheels are macOS and Windows only.
-sudo apt-get install -y --no-install-recommends \
-    gstreamer1.0-plugins-base gstreamer1.0-plugins-bad gstreamer1.0-libav
+# GStreamer's core libraries, which the adamo SDK links against (it decodes
+# video natively). uv can't install them: GStreamer's PyPI wheels are macOS and
+# Windows only.
+sudo apt-get install -y --no-install-recommends gstreamer1.0-plugins-base
 
-uv sync --extra adamo   # adamo==0.4.59, fastapi, uvicorn
+uv sync --extra adamo   # adamo 1.0, fastapi, uvicorn
 export ADAMO_API_KEY=ak_...   # optional; /start can take the key instead
 uv run deploy/adamo_server.py --policy.checkpoint-path=cache/bottles_75k.pt --port 8000
 ```
@@ -204,14 +204,13 @@ optionally `prompt` and the camera track names `head`, `wrist_left`, `wrist_righ
 (those are the defaults; `head` is a side-by-side stereo pair whose left view is the
 policy's `top` camera, set `head_stereo: false` otherwise). It claims the robot as
 an Adamo operator, sending `acquired`, then a heartbeat every second on
-`{robot}/control/json/operator_control`. If another operator acquires the robot,
+`{robot}/control/json/operator_control`. It reads joint state from
+`{robot}/state/joints`, or `{robot}/proprioception/joints` from older robots; set
+`state_topic` to read only one key. If another operator acquires the robot,
 the policy stops sending actions until `/take_control`. `GET /topics` lists every
 key the robot publishes on. If a camera sends no frame for `frame_timeout_s`
 (default 30, counted from `/start` until its first frame; `null` disables it), the
 run stops as with `/stop`, and `/status` reports why under `last_stop`.
-
-The adamo SDK is pinned to 0.4.59 because 1.0 has no API to publish arbitrary
-topics or receive video.
 
 #### On RunPod
 
@@ -231,8 +230,7 @@ topics or receive video.
    ```bash
    curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH=$HOME/.local/bin:$PATH
    apt-get update && apt-get install -y ffmpeg libegl1 libgl1
-   apt-get install -y --no-install-recommends \
-       gstreamer1.0-plugins-base gstreamer1.0-plugins-bad gstreamer1.0-libav
+   apt-get install -y --no-install-recommends gstreamer1.0-plugins-base
    git clone https://github.com/Shade5/abc.git && cd abc
    uv python pin 3.12 && uv sync --extra adamo
    ABC_CACHE=/root/cache uv run prepare.py --checkpoint

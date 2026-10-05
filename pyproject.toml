@@ -47,8 +47,8 @@ deploy = [
     "pyzmq",
     "websockets",
 ]
-# deploy/adamo_server.py. 0.4.x: 1.0 drops the publish and video-receive APIs.
-adamo = ["adamo==0.4.59", "fastapi", "uvicorn[standard]"]
+# deploy/adamo_server.py. 1.0.5 adds adamo.connect() with publishers and native video receive.
+adamo = ["adamo[video]>=1.0.5,<1.1", "fastapi", "uvicorn[standard]"]
 dev = ["ruff"]
 
 [tool.uv]

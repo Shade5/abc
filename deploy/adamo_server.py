@@ -5,7 +5,8 @@ with an Adamo API key and robot name then:
 
 - subscribes to the robot's camera tracks and decodes them (Adamo's native
   H.264 decoder) into a latest-frame slot per camera,
-- subscribes to the robot's joint state (``{robot}/proprioception/joints``),
+- subscribes to the robot's joint state: ``{robot}/state/joints`` from a robot
+  on adamo 1.0, ``{robot}/proprioception/joints`` from an older one,
 - claims the robot the way operate.adamohq.com does (``take_control``:
   acquired, then a heartbeat a second on ``{robot}/control/json/operator_control``),
 - runs an RTC inference loop on the latest observation and publishes one
@@ -37,8 +38,7 @@ import numpy as np
 import torch
 import tyro
 import uvicorn
-from adamo.operate.control import JointState
-from adamo.operate.session import Priority
+from adamo import JointState, Priority
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -91,7 +91,10 @@ class StartRequest(BaseModel):
     """Adamo video track fed to the policy's ``right`` wrist camera."""
     head_stereo: bool = True
     """The head track is a side-by-side stereo pair; the left view is used."""
-    state_topic: str = "{robot}/proprioception/joints"
+    state_topic: str | None = None
+    """Joint state key. None follows both ``{robot}/state/joints`` (JSON
+    ``{"positions": [14]}``, robots on adamo 1.0) and
+    ``{robot}/proprioception/joints`` (binary, older robots)."""
     control_topic: str = "{robot}/control/joint_state"
     control_hz: float = 30.0
     execute_steps: int = 16
@@ -130,8 +133,14 @@ class LatestSlot:
             return self.value, self.stamp
 
 
+STATE_TOPICS = ("{robot}/state/joints", "{robot}/proprioception/joints")
+
+
 def decode_joints(payload: bytes) -> np.ndarray:
-    """``[ts_us: u64 BE][f32 BE] * N`` (adamo.joints wire format)."""
+    """JSON ``{"positions": [...]}`` (a robot's state store on adamo 1.0), or
+    ``[ts_us: u64 BE][f32 BE] * N`` (the adamo 0.4 joints wire format)."""
+    if payload[:1] == b"{":
+        return np.asarray(json.loads(payload)["positions"], dtype=np.float32)
     n = (len(payload) - 8) // 4
     return np.asarray(struct.unpack_from(f">{n}f", payload, 8), dtype=np.float32)
 
@@ -154,16 +163,20 @@ class AdamoRun:
         self.session = adamo.connect(api_key=api_key)
         self.frames = {cam: LatestSlot() for cam in req.cameras}
         self.state = LatestSlot()
+        self.state_key: str | None = None  # where the latest joint state came from
         self.decode_ms = {cam: 0.0 for cam in req.cameras}
 
         self._receivers = {
             cam: self.session.video_receiver(self.robot, track, max_queued_frames=1)
             for cam, track in req.cameras.items()
         }
-        self._state_sub = self.session.subscribe(
-            req.state_topic.format(robot=self.robot),
-            callback=lambda s: self.state.set(decode_joints(s.payload)),
-        )
+        state_topics = (req.state_topic,) if req.state_topic else STATE_TOPICS
+        self._state_subs = [
+            self.session.subscribe(
+                topic.format(robot=self.robot), callback=self._on_state
+            )
+            for topic in state_topics
+        ]
         self._control_pub = self.session.publisher(
             req.control_topic.format(robot=self.robot),
             priority=Priority.REAL_TIME,
@@ -189,8 +202,10 @@ class AdamoRun:
             ownership_topic, callback=self._on_ownership
         )
 
-        # Shared between the inference and control threads.
+        # Shared between the inference and control threads. Ownership changes
+        # take the lock too, so no action is published after control is lost.
         self._chunk_lock = threading.Lock()
+        self._generation = 0  # bumped on every ownership change
         self._chunk: np.ndarray | None = None
         self._chunk_start = 0  # control step that chunk[0] is executed at
         self._step = 0  # control steps published so far
@@ -209,16 +224,20 @@ class AdamoRun:
     # -- cameras ---------------------------------------------------------------
 
     def _camera_loop(self, cam: str) -> None:
-        rx = self._receivers[cam]
         while not self.stop_event.is_set():
+            rx = self._receivers[cam]
             try:
                 frame = rx.recv(timeout=0.5)
             except TimeoutError:
                 continue
             except Exception as e:
-                logger.exception("camera %s receive failed", cam)
+                # A decode error resets on its own, but a connection error ends
+                # the receiver, so reopen it either way.
+                logger.exception("camera %s receive failed; reopening", cam)
                 self.error = f"camera {cam}: {e}"
-                time.sleep(0.5)
+                if self.stop_event.wait(0.5):
+                    break
+                self._reopen_receiver(cam)
                 continue
             t0 = time.perf_counter()
             rgba = np.asarray(frame.rgba)
@@ -228,6 +247,28 @@ class AdamoRun:
             rgb = rgba[..., :3].transpose(2, 0, 1).copy()
             self.frames[cam].set(rgb)
             self.decode_ms[cam] = (time.perf_counter() - t0) * 1e3
+
+    def _on_state(self, sample) -> None:
+        try:
+            joints = decode_joints(bytes(sample.payload))
+        except (ValueError, KeyError, struct.error) as e:
+            self.error = f"joint state on {sample.key}: {e!r}"
+            return
+        self.state_key = sample.key
+        self.state.set(joints)
+
+    def _reopen_receiver(self, cam: str) -> None:
+        try:
+            self._receivers[cam].close()
+        except Exception:
+            logger.exception("camera %s close failed", cam)
+        try:
+            self._receivers[cam] = self.session.video_receiver(
+                self.robot, self.req.cameras[cam], max_queued_frames=1
+            )
+        except Exception as e:
+            logger.exception("camera %s reopen failed", cam)
+            self.error = f"camera {cam}: reopen failed: {e}"
 
     def latest_obs(self) -> dict | None:
         state, _ = self.state.get()
@@ -276,8 +317,7 @@ class AdamoRun:
         if msg.get("active"):
             if self.in_control and msg.get("event") == "acquired":
                 logger.warning("control taken by %s", operator.get("displayName"))
-                self.in_control = False
-                self._clear_chunk()
+                self._set_in_control(False)
             self.controller, self._controller_seen = operator, time.monotonic()
         elif self.controller and operator.get("sessionId") == self.controller.get(
             "sessionId"
@@ -286,18 +326,24 @@ class AdamoRun:
 
     def take_control(self) -> None:
         """Claim the robot and start sending actions from a fresh chunk."""
-        self._clear_chunk()
         self._publish_ownership("acquired", active=True)
-        self.in_control = True
+        self._set_in_control(True)
         self.controller = None
 
     def release_control(self) -> None:
         """Stop sending actions and give up the claim."""
         if not self.in_control:
             return
-        self.in_control = False
-        self._clear_chunk()
+        self._set_in_control(False)
         self._publish_ownership("released", active=False)
+
+    def _set_in_control(self, in_control: bool) -> None:
+        """Change ownership and drop the chunk; inference started under the
+        previous generation is discarded even if control has come back since."""
+        with self._chunk_lock:
+            self.in_control = in_control
+            self._chunk = None
+            self._generation += 1
 
     def _heartbeat_loop(self) -> None:
         while not self.stop_event.wait(HEARTBEAT_S):
@@ -309,10 +355,6 @@ class AdamoRun:
             ):
                 self.controller = None  # its lease lapsed without a release
 
-    def _clear_chunk(self) -> None:
-        with self._chunk_lock:
-            self._chunk = None
-
     # -- inference (runs on the policy thread) ---------------------------------
 
     def inference_step(self) -> bool:
@@ -322,6 +364,7 @@ class AdamoRun:
             return False
         with self._chunk_lock:
             chunk, start, step = self._chunk, self._chunk_start, self._step
+            generation = self._generation
         if (
             chunk is not None
             and step - start < req.execute_steps - req.inference_lead_steps
@@ -348,7 +391,7 @@ class AdamoRun:
         self.infer_ms = self.infer_ms[-100:]
 
         with self._chunk_lock:
-            if not self.in_control or self._chunk is not chunk:
+            if self._generation != generation or self._chunk is not chunk:
                 return True  # control changed hands mid-inference; drop it
             # The new chunk starts at the step inference was launched from; any
             # steps executed meanwhile came from the prefix it was conditioned on.
@@ -365,14 +408,14 @@ class AdamoRun:
             next_tick += period
             with self._chunk_lock:
                 chunk, start = self._chunk, self._chunk_start
-                if chunk is not None:
+                if chunk is not None and self.in_control:
                     idx = min(self._step - start, len(chunk) - 1)
-                    action = chunk[idx]
+                    msg = JointState(names=JOINT_NAMES, positions=chunk[idx].tolist())
                     self._step += 1
-            if chunk is not None:
-                msg = JointState(names=JOINT_NAMES, positions=action.tolist())
-                self._control_pub.put(msg.to_json())
-                self.published += 1
+                    # Under the lock, so a release can't land between the
+                    # ownership check and the put.
+                    self._control_pub.put(msg.to_json())
+                    self.published += 1
             delay = next_tick - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
@@ -400,6 +443,7 @@ class AdamoRun:
                 for cam, slot in self.frames.items()
             },
             "state": {
+                "key": self.state_key,
                 "msgs": self.state.count,
                 "age_ms": round((now - state_t) * 1e3) if self.state.count else None,
                 "dim": None if state is None else len(state),
@@ -423,7 +467,7 @@ class AdamoRun:
         for t in self._threads:
             t.join(timeout=2)
         for closable in (
-            self._state_sub,
+            *self._state_subs,
             self._ownership_sub,
             self._control_pub,
             self._ownership_pub,
