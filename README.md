@@ -206,7 +206,9 @@ policy's `top` camera, set `head_stereo: false` otherwise). It claims the robot 
 an Adamo operator, sending `acquired`, then a heartbeat every second on
 `{robot}/control/json/operator_control`. If another operator acquires the robot,
 the policy stops sending actions until `/take_control`. `GET /topics` lists every
-key the robot publishes on.
+key the robot publishes on. If a camera sends no frame for `frame_timeout_s`
+(default 30, counted from `/start` until its first frame; `null` disables it), the
+run stops as with `/stop`, and `/status` reports why under `last_stop`.
 
 The adamo SDK is pinned to 0.4.59 because 1.0 has no API to publish arbitrary
 topics or receive video.

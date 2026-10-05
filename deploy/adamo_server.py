@@ -100,6 +100,9 @@ class StartRequest(BaseModel):
     """Start the next inference this many steps before ``execute_steps``."""
     prefix_length: int = 4
     """RTC prefix: not-yet-executed actions the next chunk is conditioned on."""
+    frame_timeout_s: float | None = 30.0
+    """Stop the run (as ``POST /stop``) when a camera has sent no frame for this
+    long, counted from ``/start`` until its first frame. None disables it."""
 
     @property
     def cameras(self) -> dict[str, str]:
@@ -143,6 +146,7 @@ class AdamoRun:
         self.robot = req.robot_name
         self.stop_event = threading.Event()
         self.error: str | None = None
+        self.started = time.monotonic()
 
         api_key = req.adamo_api_key or os.environ.get("ADAMO_API_KEY")
         if not api_key:
@@ -236,6 +240,18 @@ class AdamoRun:
                 return None
             images[cam] = img
         return {"state": state, "images": images, "prompt": self.prompt}
+
+    def frame_timeout(self) -> str | None:
+        """Why the run timed out waiting for camera frames, or None."""
+        timeout = self.req.frame_timeout_s
+        if timeout is None:
+            return None
+        now = time.monotonic()
+        for cam, slot in self.frames.items():
+            age = now - (slot.stamp if slot.count else self.started)
+            if age > timeout:
+                return f"no frames from the {cam} camera for {age:.0f} s"
+        return None
 
     # -- operator control --------------------------------------------------------
 
@@ -433,7 +449,8 @@ class PolicyWorker:
         self.phase = "loading"
         self.error: str | None = None
         self.run: AdamoRun | None = None
-        self._lock = threading.Lock()
+        self.last_stop: str | None = None  # why the last run stopped on its own
+        self._lock = threading.RLock()
         self._thread = threading.Thread(target=self._main, daemon=True)
         self._thread.start()
 
@@ -456,6 +473,10 @@ class PolicyWorker:
             if run is None or run.stop_event.is_set():
                 time.sleep(0.005)
                 continue
+            reason = run.frame_timeout()
+            if reason is not None:
+                self._stop_timed_out(run, reason)
+                continue
             try:
                 if not run.inference_step():
                     time.sleep(0.002)
@@ -463,6 +484,13 @@ class PolicyWorker:
                 logger.exception("inference failed")
                 run.error = f"inference: {e!r}"
                 time.sleep(0.5)
+
+    def _stop_timed_out(self, run: AdamoRun, reason: str) -> None:
+        logger.warning("stopping %s: %s", run.robot, reason)
+        with self._lock:
+            if self.run is run:  # not already stopped or replaced by /start
+                self.last_stop = reason
+                self.stop()
 
     def _load_engine(self) -> bool:
         if not (self.engine_path and os.path.exists(self.engine_path)):
@@ -494,14 +522,16 @@ class PolicyWorker:
             raise HTTPException(503, f"policy not ready ({self.phase})")
         with self._lock:
             self.stop()
+            self.last_stop = None
             self.run = AdamoRun(req, self.policy, req.prompt or self.config.prompt)
             self.run.take_control()
             return self.run
 
     def stop(self) -> None:
-        run, self.run = self.run, None
-        if run is not None:
-            run.close()
+        with self._lock:
+            run, self.run = self.run, None
+            if run is not None:
+                run.close()
 
 
 def create_app(args: Args) -> FastAPI:
@@ -549,6 +579,7 @@ def create_app(args: Args) -> FastAPI:
         return {
             "policy": worker.phase,
             "policy_error": worker.error,
+            "last_stop": worker.last_stop,
             "run": None if run is None else run.status(),
         }
 
