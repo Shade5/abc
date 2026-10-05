@@ -32,6 +32,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import adamo
 import numpy as np
@@ -75,6 +76,39 @@ class Args:
     """Compiled-policy cache (torch.compiler cache artifacts) for this GPU, e.g.
     /workspace-global/abc/3090/engine.bin. Loaded before compiling so startup
     skips the compile; written after a compile when it is missing."""
+
+
+def cpu_quota() -> float | None:
+    """CPUs this container may use (cgroup quota), or None when unlimited."""
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()  # cgroup v2
+        return None if quota == "max" else int(quota) / int(period)
+    except (OSError, ValueError):
+        pass
+    try:  # cgroup v1
+        quota = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read_text())
+        period = int(Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text())
+        return None if quota <= 0 else quota / period
+    except (OSError, ValueError):
+        return None
+
+
+def cap_torch_threads() -> int | None:
+    """Size torch's CPU thread pool to half the container's CPU quota, leaving
+    the rest for the camera decoders, unless OMP_NUM_THREADS says otherwise.
+
+    torch sizes the pool from the host's core count: on a RunPod 4090 that is
+    120 threads in a 12.75-CPU container, which throttles every thread, takes
+    each inference from ~50 ms to ~2.6 s, and starves video decoding.
+    """
+    if "OMP_NUM_THREADS" in os.environ:
+        return None
+    quota = cpu_quota()
+    if quota is None:
+        return None
+    threads = max(1, int(quota) // 2)
+    torch.set_num_threads(threads)
+    return threads
 
 
 class StartRequest(BaseModel):
@@ -499,6 +533,7 @@ class PolicyWorker:
         self._thread.start()
 
     def _main(self) -> None:
+        cap_torch_threads()  # per thread: this one runs every inference
         try:
             t0 = time.perf_counter()
             self.phase = "compiling" if self.config.fast_inference else "loading"
@@ -655,6 +690,11 @@ def create_app(args: Args) -> FastAPI:
 
 def main(args: Args) -> None:
     logging.basicConfig(level=logging.WARNING, force=True)
+    threads = cap_torch_threads()
+    if threads is not None:
+        logger.warning(
+            "torch CPU threads: %d (half of a %.2f-CPU quota)", threads, cpu_quota()
+        )
     uvicorn.run(create_app(args), host=args.host, port=args.port)
 
 
