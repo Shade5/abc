@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import gc
 import json
+import logging
 import warnings
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -11,6 +13,14 @@ from typing import Any
 import numpy as np
 import torch
 
+from abc_minimal.aot_engine import (
+    EngineMismatch,
+    SamplerEngine,
+    build_engine,
+    engine_key,
+    load_engine,
+    norm_stats_to_json,
+)
 from abc_minimal.checkpointing import model_state_dict
 from abc_minimal.config import (
     FlowConfig,
@@ -28,6 +38,8 @@ from abc_minimal.preprocess import (
     unnormalize,
 )
 from abc_minimal.vla import VLAPolicy, inference_model_config, stack_camera_batch
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_norm_stats(ckpt: dict[str, Any], override: str | None) -> dict[str, Any]:
@@ -188,30 +200,124 @@ class DiTInferencePolicy(InferencePolicy):
     # Fast inference compiles FusedDiTSampler; False compiles the stock sampler.
     fused_sampler = True
 
-    def __init__(self, checkpoint: Path, config: Any, device: str, model_config: Any = None):
+    def __init__(
+        self,
+        checkpoint: Path,
+        config: Any,
+        device: str,
+        model_config: Any = None,
+        engine: SamplerEngine | None = None,
+    ):
+        """With ``engine`` (see from_engine), the compiled engine replaces the model
+        and the checkpoint is not read."""
         self.config = config
         self.model_config = model_config if model_config is not None else config.model
         self.device = torch.device(device)
         self.diffusion_steps = config.diffusion_steps
         self.chunk_length = self.model_config.chunk_length
         self.action_dim = self.model_config.action_dim
-        self.model = DiTPolicy(self.model_config).to(self.device)
-        ckpt = load_pretrained(self.model, checkpoint)
-        self.model.eval()
+        self._engine = engine
+        if engine is None:
+            self.model = DiTPolicy(self.model_config).to(self.device)
+            ckpt = load_pretrained(self.model, checkpoint)
+            self.model.eval()
+            self.norm_stats = resolve_norm_stats(ckpt, config.norm_stats_path)
+            self.trained_max_prefix = resolve_trained_max_prefix(ckpt)
+        else:
+            self.model = None
+            self.norm_stats = resolve_norm_stats(engine.metadata, config.norm_stats_path)
+            self.trained_max_prefix = engine.trained_max_prefix
         self.norm_preset = preset_for_backbone(self.model_config.vision_backbone)
-        self.norm_stats = resolve_norm_stats(ckpt, config.norm_stats_path)
-        self.trained_max_prefix = resolve_trained_max_prefix(ckpt)
         self.embedder = CLIPTextEmbedder(config.clip, device=self.device)
         self._prompt = config.prompt
         self.task_vec = self.embedder.encode([self._prompt]).to(self.device)
-        self._fast_inference_enabled = False
+        self._fast_inference_enabled = engine is not None
+        if engine is not None:
+            self.task_vec = self.task_vec.to(torch.bfloat16)
+
+    @classmethod
+    def from_engine(
+        cls,
+        engine_path: Path,
+        checkpoint: Path,
+        config: Any,
+        device: str,
+        model_config: Any = None,
+        compile_mode: str = "max-autotune",
+    ) -> "DiTInferencePolicy":
+        """Fast inference from an AOT-compiled engine file (see aot_engine.py).
+
+        Loads ``engine_path`` when it was built for this GPU, torch, checkpoint
+        and config, which takes seconds. Otherwise (missing, stale or unreadable)
+        loads the checkpoint, builds the engine into ``engine_path`` and loads
+        that, so a bad file costs one compile instead of a failed start.
+        """
+        engine_path = Path(engine_path)
+        checkpoint = Path(checkpoint)
+        device_t = torch.device(device)
+        if device_t.type != "cuda":
+            raise RuntimeError("compiled engines require a CUDA device")
+        mc = model_config if model_config is not None else config.model
+        key = engine_key(checkpoint, mc, config.diffusion_steps, device_t)
+        engine = None
+        if engine_path.exists():
+            try:
+                engine = load_engine(engine_path, key, device_t)
+            except EngineMismatch as e:
+                logger.warning("rebuilding the engine at %s: %s", engine_path, e)
+        else:
+            logger.warning("no engine at %s; building one (one-time compile)", engine_path)
+        if engine is None:
+            if not checkpoint.exists():
+                raise FileNotFoundError(
+                    f"no usable engine at {engine_path}, and building one needs the "
+                    f"checkpoint, which is missing: {checkpoint}"
+                )
+            builder = cls(checkpoint, config, device, model_config)
+            builder.build_engine(engine_path, key, compile_mode)
+            del builder
+            gc.collect()
+            torch.cuda.empty_cache()
+            engine = load_engine(engine_path, key, device_t)
+        return cls(checkpoint, config, device, model_config, engine=engine)
+
+    def build_engine(self, path: Path, key: dict[str, Any], compile_mode: str) -> None:
+        """Cast to bf16 and AOT-compile the fused sampler into an engine at ``path``."""
+        self.model.to(torch.bfloat16)
+        self.model.img_backbone.set_bfloat16(True)
+        self.task_vec = self.task_vec.to(device=self.device, dtype=torch.bfloat16)
+        m = self.model_config
+        image = resize_pad_normalize(
+            np.zeros((3, self.config.camera_height, self.config.camera_width), dtype=np.uint8),
+            preset=self.norm_preset,
+        )
+        example = {
+            "state": torch.zeros(1, m.state_dim, device=self.device),
+            "task_vec": self.task_vec,
+            "noise": torch.zeros(1, m.chunk_length, m.action_dim, device=self.device),
+            "images": {cam: image.unsqueeze(0).to(self.device) for cam in m.camera_keys},
+        }
+        metadata = {
+            **key,
+            "norm_stats": norm_stats_to_json(self.norm_stats),
+            "trained_max_prefix": self.trained_max_prefix,
+        }
+        build_engine(
+            path,
+            FusedDiTSampler(self.model),
+            list(m.camera_keys),
+            self.diffusion_steps,
+            example,
+            metadata,
+            compile_mode,
+        )
 
     def set_prompt(self, prompt: str) -> None:
         if prompt == self._prompt:
             return
         self._prompt = prompt
         self.task_vec = self.embedder.encode([prompt]).to(
-            device=self.device, dtype=self.model.x_embedder.weight.dtype
+            device=self.device, dtype=self.task_vec.dtype
         )
 
     def _compile_for_fast_inference(self, compile_mode: str) -> None:
@@ -295,9 +401,12 @@ class DiTInferencePolicy(InferencePolicy):
             )
             noise_t = torch.from_numpy(noise_arr).to(self.device)
         if action_prefix is None:
-            actions = self.model.sample_actions(
-                batch, num_steps=self.diffusion_steps, noise=noise_t
-            )
+            if self._engine is not None:
+                actions = self._engine.sample(batch, noise=noise_t)
+            else:
+                actions = self.model.sample_actions(
+                    batch, num_steps=self.diffusion_steps, noise=noise_t
+                )
         else:
             prefix = self.normalized_action_prefix(
                 action_prefix, prefix_length
@@ -305,13 +414,18 @@ class DiTInferencePolicy(InferencePolicy):
             prefix_t = torch.from_numpy(prefix).to(
                 device=self.device, dtype=batch["state"].dtype
             )
-            actions = self.model.sample_actions_rtc(
-                batch,
-                prefix_t,
-                prefix_length=prefix_length,
-                num_steps=self.diffusion_steps,
-                noise=noise_t,
-            )
+            if self._engine is not None:
+                actions = self._engine.sample(
+                    batch, noise=noise_t, action_prefix=prefix_t, prefix_length=prefix_length
+                )
+            else:
+                actions = self.model.sample_actions_rtc(
+                    batch,
+                    prefix_t,
+                    prefix_length=prefix_length,
+                    num_steps=self.diffusion_steps,
+                    noise=noise_t,
+                )
         actions_np = actions.float().detach().cpu().numpy()
         actions_np = unnormalize(actions_np, self.norm_stats["actions"]).astype(
             np.float32

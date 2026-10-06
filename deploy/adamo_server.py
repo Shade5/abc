@@ -72,9 +72,23 @@ class Args:
     host: str = "0.0.0.0"
     port: int = 8000
     engine_path: str | None = None
-    """Compiled-policy cache (torch.compiler cache artifacts) for this GPU, e.g.
-    /workspace-global/abc/3090/engine.bin. Loaded before compiling so startup
-    skips the compile; written after a compile when it is missing."""
+    """AOT-compiled policy engine (.pt2) for this GPU, e.g.
+    /workspace/abc/3090/engine.pt2. Loaded in seconds without the checkpoint;
+    built from the checkpoint and written here when missing or stale. A .bin path
+    (the older torch.compile cache) is read as the .pt2 beside it."""
+
+
+def resolve_engine_path(path: str | None) -> Path | None:
+    """The .pt2 engine path; an older .bin (torch.compile cache) path maps beside it."""
+    if path is None:
+        return None
+    engine = Path(path).expanduser()
+    if engine.suffix != ".pt2":
+        logger.warning(
+            "engine path %s is not a .pt2 engine; using %s", engine, engine.with_suffix(".pt2")
+        )
+        engine = engine.with_suffix(".pt2")
+    return engine
 
 
 def cpu_quota() -> float | None:
@@ -512,7 +526,7 @@ class PolicyWorker:
 
     def __init__(self, config: PolicyConfig, engine_path: str | None = None) -> None:
         self.config = config
-        self.engine_path = engine_path
+        self.engine_path = resolve_engine_path(engine_path)
         self.policy: Policy | None = None
         self.phase = "loading"
         self.error: str | None = None
@@ -527,11 +541,8 @@ class PolicyWorker:
         try:
             t0 = time.perf_counter()
             self.phase = "compiling" if self.config.fast_inference else "loading"
-            loaded = self._load_engine()
-            self.policy = Policy(self.config)
+            self.policy = Policy(self.config, engine_path=self.engine_path)
             logger.warning("policy ready in %.0f s", time.perf_counter() - t0)
-            if not loaded:
-                self._save_engine()
             self.phase = "ready"
         except Exception as e:
             logger.exception("policy load failed")
@@ -560,31 +571,6 @@ class PolicyWorker:
             if self.run is run:  # not already stopped or replaced by /start
                 self.last_stop = reason
                 self.stop()
-
-    def _load_engine(self) -> bool:
-        if not (self.engine_path and os.path.exists(self.engine_path)):
-            return False
-        with open(self.engine_path, "rb") as f:
-            torch.compiler.load_cache_artifacts(f.read())
-        logger.warning("loaded compiled engine from %s", self.engine_path)
-        return True
-
-    def _save_engine(self) -> None:
-        if not (self.engine_path and self.config.fast_inference):
-            return
-        artifacts = torch.compiler.save_cache_artifacts()
-        if artifacts is None:
-            logger.warning("no compile artifacts to save")
-            return
-        os.makedirs(os.path.dirname(self.engine_path) or ".", exist_ok=True)
-        # Written in place: global volumes don't support atomic rename.
-        with open(self.engine_path, "wb") as f:
-            f.write(artifacts[0])
-        logger.warning(
-            "saved compiled engine to %s (%.0f MB)",
-            self.engine_path,
-            len(artifacts[0]) / 1e6,
-        )
 
     def start(self, req: StartRequest) -> AdamoRun:
         if self.policy is None:

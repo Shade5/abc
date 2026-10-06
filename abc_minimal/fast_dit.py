@@ -83,7 +83,7 @@ class FusedDiTSampler(torch.nn.Module):
         model = self.model
         H = self.hidden
         nh = self.num_heads
-        z = model.y_embedder(x_t) + model.pos_embed.data[:, : x_t.shape[1], :]
+        z = model.y_embedder(x_t) + model.pos_embed[:, : x_t.shape[1], :]
         B, T, _ = z.shape
         for j, block in enumerate(model.blocks):
             (
@@ -111,8 +111,14 @@ class FusedDiTSampler(torch.nn.Module):
         return fl.linear(fl.norm_final(z) * (1 + scale) + shift)
 
     @torch.no_grad()
-    def prepare(self, batch, num_steps, noise, action_prefix=None, prefix_length: int = 0):
-        """Everything step-invariant: x_0, modulations, cross-attention K/V, prefix mask."""
+    def prepare(
+        self, batch, num_steps, noise, action_prefix=None, prefix_length: int = 0, prefix_mask=None
+    ):
+        """Everything step-invariant: x_0, modulations, cross-attention K/V, prefix mask.
+
+        ``prefix_mask`` (bool, (B|1, chunk, 1)) replaces ``prefix_length`` so the
+        prefix length can be data instead of a constant (see aot_engine.py).
+        """
         model = self.model
         state = batch["state"]
         B = state.shape[0]
@@ -120,11 +126,13 @@ class FusedDiTSampler(torch.nn.Module):
         if noise is None:
             noise = torch.randn(B, model.chunk_length, model.action_dim, device=state.device, dtype=dtype)
         x_t = noise.to(device=state.device, dtype=dtype)
-        prefix_mask = None
-        if action_prefix is not None:
+        if action_prefix is None:
+            prefix_mask = None
+        else:
             action_prefix = action_prefix.to(device=state.device, dtype=dtype)
-            prefix_pos = torch.arange(model.chunk_length, device=state.device) < prefix_length
-            prefix_mask = prefix_pos.view(1, model.chunk_length, 1)
+            if prefix_mask is None:
+                prefix_pos = torch.arange(model.chunk_length, device=state.device) < prefix_length
+                prefix_mask = prefix_pos.view(1, model.chunk_length, 1)
             x_t = torch.where(prefix_mask, action_prefix, x_t)
         vision_tokens = model.build_vision_tokens(batch["images"])
         mods = self._modulations(state, batch["task_vec_clip"], num_steps, dtype)
