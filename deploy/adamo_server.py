@@ -5,8 +5,7 @@ with an Adamo API key and robot name then:
 
 - subscribes to the robot's camera tracks and decodes them (Adamo's native
   H.264 decoder) into a latest-frame slot per camera,
-- subscribes to the robot's joint state: ``{robot}/state/joints`` from a robot
-  on adamo 1.0, ``{robot}/proprioception/joints`` from an older one,
+- subscribes to the robot's joint state on ``{robot}/proprioception/joints``,
 - claims the robot the way operate.adamohq.com does (``take_control``:
   acquired, then a heartbeat a second on ``{robot}/control/json/operator_control``),
 - runs an RTC inference loop on the latest observation and publishes one
@@ -125,10 +124,8 @@ class StartRequest(BaseModel):
     """Adamo video track fed to the policy's ``right`` wrist camera."""
     head_stereo: bool = True
     """The head track is a side-by-side stereo pair; the left view is used."""
-    state_topic: str | None = None
-    """Joint state key. None follows both ``{robot}/state/joints`` (JSON
-    ``{"positions": [14]}``, robots on adamo 1.0) and
-    ``{robot}/proprioception/joints`` (binary, older robots)."""
+    state_topic: str = "{robot}/proprioception/joints"
+    """Joint state key: a big-endian u64 timestamp (µs), then a float32 per joint."""
     control_topic: str = "{robot}/control/joint_state"
     control_hz: float = 30.0
     execute_steps: int = 16
@@ -167,14 +164,12 @@ class LatestSlot:
             return self.value, self.stamp
 
 
-STATE_TOPICS = ("{robot}/state/joints", "{robot}/proprioception/joints")
-
-
 def decode_joints(payload: bytes) -> np.ndarray:
-    """JSON ``{"positions": [...]}`` (a robot's state store on adamo 1.0), or
-    ``[ts_us: u64 BE][f32 BE] * N`` (the adamo 0.4 joints wire format)."""
-    if payload[:1] == b"{":
-        return np.asarray(json.loads(payload)["positions"], dtype=np.float32)
+    """``[ts_us: u64 BE][f32 BE] * N``, the robot's joints wire format."""
+    if len(payload) < 8 or (len(payload) - 8) % 4:
+        raise ValueError(
+            f"{len(payload)} bytes is not a u64 timestamp followed by float32 joints"
+        )
     n = (len(payload) - 8) // 4
     return np.asarray(struct.unpack_from(f">{n}f", payload, 8), dtype=np.float32)
 
@@ -197,20 +192,16 @@ class AdamoRun:
         self.session = adamo.connect(api_key=api_key)
         self.frames = {cam: LatestSlot() for cam in req.cameras}
         self.state = LatestSlot()
-        self.state_key: str | None = None  # where the latest joint state came from
+        self.state_key = req.state_topic.format(robot=self.robot)
         self.decode_ms = {cam: 0.0 for cam in req.cameras}
 
         self._receivers = {
             cam: self.session.video_receiver(self.robot, track, max_queued_frames=1)
             for cam, track in req.cameras.items()
         }
-        state_topics = (req.state_topic,) if req.state_topic else STATE_TOPICS
-        self._state_subs = [
-            self.session.subscribe(
-                topic.format(robot=self.robot), callback=self._on_state
-            )
-            for topic in state_topics
-        ]
+        self._state_sub = self.session.subscribe(
+            self.state_key, callback=self._on_state
+        )
         self._control_pub = self.session.publisher(
             req.control_topic.format(robot=self.robot),
             priority=Priority.REAL_TIME,
@@ -285,10 +276,9 @@ class AdamoRun:
     def _on_state(self, sample) -> None:
         try:
             joints = decode_joints(bytes(sample.payload))
-        except (ValueError, KeyError, struct.error) as e:
+        except (ValueError, struct.error) as e:
             self.error = f"joint state on {sample.key}: {e!r}"
             return
-        self.state_key = sample.key
         self.state.set(joints)
 
     def _reopen_receiver(self, cam: str) -> None:
@@ -501,7 +491,7 @@ class AdamoRun:
         for t in self._threads:
             t.join(timeout=2)
         for closable in (
-            *self._state_subs,
+            self._state_sub,
             self._ownership_sub,
             self._control_pub,
             self._ownership_pub,

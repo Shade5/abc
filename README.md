@@ -160,7 +160,7 @@ CUDA_VISIBLE_DEVICES=0 uv run deploy/serve_policy.py \
 
 `deploy/adamo_server.py` is a FastAPI server that drives a robot streamed over
 [Adamo](https://docs.adamohq.com) (for example the `abc-sim` bottles-in-bin sim). It
-decodes the robot's camera tracks and reads its joint state (`{robot}/state/joints`),
+decodes the robot's camera tracks and reads its joint state (`{robot}/proprioception/joints`),
 runs the fast policy with RTC, and publishes 14-D joint targets at 30 Hz as
 JointState JSON on `{robot}/control/joint_state`. The robot must run adamo 1.0 or
 later: adamo 1.0's video receiver can't decode a 0.4 robot's video.
@@ -205,8 +205,8 @@ optionally `prompt` and the camera track names `head`, `wrist_left`, `wrist_righ
 policy's `top` camera, set `head_stereo: false` otherwise). It claims the robot as
 an Adamo operator, sending `acquired`, then a heartbeat every second on
 `{robot}/control/json/operator_control`. It reads joint state from
-`{robot}/state/joints`, or `{robot}/proprioception/joints` from older robots; set
-`state_topic` to read only one key. If another operator acquires the robot,
+`{robot}/proprioception/joints` as a big-endian u64 timestamp (µs) then a float32
+per joint; `state_topic` names another key. If another operator acquires the robot,
 the policy stops sending actions until `/take_control`. `GET /topics` lists every
 key the robot publishes on. If a camera sends no frame for `frame_timeout_s`
 (default 30, counted from `/start` until its first frame; `null` disables it), the
