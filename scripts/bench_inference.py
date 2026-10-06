@@ -7,6 +7,7 @@ RTC prefix of 4 actions. Each mode runs in its own process:
     uv run scripts/bench_inference.py --mode eager    # --no-fast-inference (fp32)
     uv run scripts/bench_inference.py --mode stock    # bf16 + compiled stock sampler
     uv run scripts/bench_inference.py --mode fused    # bf16 + FusedDiTSampler, step compiled once
+    uv run scripts/bench_inference.py --mode engine --engine-path engine.pt2  # AOT-compiled fused sampler
 
 Actions use fixed noise and are saved under --out; every mode after the first
 prints its max difference from the eager fp32 actions.
@@ -85,7 +86,10 @@ def stats(ms: np.ndarray) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--mode", choices=["eager", "stock", "fused"], required=True)
+    parser.add_argument("--mode", choices=["eager", "stock", "fused", "engine"], required=True)
+    parser.add_argument(
+        "--engine-path", help="engine mode: the .pt2 engine, built first when missing"
+    )
     parser.add_argument("--checkpoint", default=str(CACHE / "bottles_75k.pt"))
     parser.add_argument("--task", default="put_plastic_bottles_in_bin")
     parser.add_argument("--iters", type=int, default=200)
@@ -100,14 +104,28 @@ def main() -> None:
     obs = sim_observation(config, out / f"obs_{args.task}.npz")
     print(f"gpu={torch.cuda.get_device_name()} torch={torch.__version__} prompt={obs['prompt']!r}")
 
-    policy = DiTInferencePolicy(Path(args.checkpoint), config, "cuda", model_config=config.model)
+    t0 = time.perf_counter()
+    if args.mode == "engine":
+        if not args.engine_path:
+            parser.error("--mode engine needs --engine-path")
+        policy = DiTInferencePolicy.from_engine(
+            Path(args.engine_path), Path(args.checkpoint), config, "cuda",
+            model_config=config.model, compile_mode=config.fast_compile_mode,
+        )
+    else:
+        policy = DiTInferencePolicy(Path(args.checkpoint), config, "cuda", model_config=config.model)
+    print(f"policy load {time.perf_counter() - t0:.1f}s")
     m = config.model
     noise = np.random.default_rng(0).standard_normal((m.chunk_length, m.action_dim), dtype=np.float32)
     # A realistic RTC prefix: hold the current joint state for prefix_length actions.
     prefix = np.repeat(obs["state"][None, : m.action_dim], args.prefix_length, axis=0)
 
     t0 = time.perf_counter()
-    if args.mode != "eager":
+    if args.mode == "engine":
+        for _ in range(3):
+            policy.infer(obs, noise=noise)
+            policy.infer(obs, noise=noise, action_prefix=prefix, prefix_length=args.prefix_length)
+    elif args.mode != "eager":
         policy.fused_sampler = args.mode == "fused"
         policy.enable_fast_inference(
             compile_mode=config.fast_compile_mode,

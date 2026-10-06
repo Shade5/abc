@@ -58,6 +58,38 @@ Euler steps, which also keeps compile time down. Set
 The first fast call compiles and autotunes (about 9 minutes on a 3090); later calls
 replay CUDA graphs.
 
+### Compiled engine files
+
+`torch.compile` repeats most of that work in every new process: its caches skip the
+autotuning but not loading the fp32 checkpoint, tracing the model or capturing CUDA
+graphs (about 6 minutes on an RTX PRO 4000 Blackwell even with a warm cache).
+`abc_minimal/aot_engine.py` instead compiles the fused sampler ahead of time with
+AOTInductor into one `.pt2` engine file per GPU: the compiled kernels, the bf16
+weights they read and the normalization stats. Loading an engine needs neither the
+checkpoint nor the Python model, and the whole sampler (vision encoder, modulations
+and all 10 Euler steps) runs as one CUDA graph. The RTC prefix is a mask input, so
+one graph serves plain and RTC chunks.
+
+```python
+policy = DiTInferencePolicy.from_engine(
+    Path("engine.pt2"), Path(config.checkpoint), config, "cuda", model_config=config.model
+)
+```
+
+`from_engine` builds the engine from the checkpoint when the file is missing, or
+was built for another GPU, torch version, checkpoint or config, then loads it.
+Engines serve one observation at a time.
+
+RTX PRO 4000 Blackwell, same benchmark as below:
+
+| Configuration | Latency | Max action diff vs fp32 | Startup |
+| --- | ---: | ---: | ---: |
+| Fused fast inference (`torch.compile`) | 53.1 ms | 0.031 std | 637 s, then 366 s with a warm cache |
+| **Engine** | **53.0 ms** | 0.023 std | 415 s to build, then 28-40 s |
+
+Loading is bound by reading the 4.3 GB engine; the numbers above are from a RunPod
+global volume (110-230 MB/s).
+
 ### Results
 
 RTX 3090, `bottles_75k.pt`, one rendered sim observation (3 cameras at 168x224),
@@ -81,6 +113,7 @@ others compare against its actions):
 uv run scripts/bench_inference.py --mode eager   # fp32 reference
 uv run scripts/bench_inference.py --mode stock   # bf16, stock sampler compiled
 uv run scripts/bench_inference.py --mode fused   # bf16, fused sampler compiled
+uv run scripts/bench_inference.py --mode engine --engine-path engine.pt2  # AOT-compiled engine
 ```
 
 Next steps: the fused sampler reaches about half of the 3090's memory bandwidth, so
@@ -179,15 +212,18 @@ uv run deploy/adamo_server.py --policy.checkpoint-path=cache/bottles_75k.pt --po
 ```
 
 The server compiles the policy at startup, about 13 minutes on a 3090.
-`--engine-path` keeps the compiled policy in one file, so later starts skip
-the compile: when the file exists it is loaded first, otherwise it is written
-after compiling. Engines are specific to the GPU model and the torch version,
-so keep one per GPU, for example on a shared volume:
+`--engine-path` keeps the compiled policy in one [engine file](#compiled-engine-files),
+so later starts load it in well under a minute instead: when the file is missing or
+stale it is built from the checkpoint and written there, otherwise it is loaded and
+the checkpoint isn't read. Engines are specific to the GPU model, the torch version
+and the checkpoint, so keep one per GPU, for example on a shared volume:
 
 ```bash
 uv run deploy/adamo_server.py --policy.checkpoint-path=cache/bottles_75k.pt \
-    --engine-path /workspace/abc/3090/engine.bin   # 541 MB; 2 min startup instead of 13
+    --engine-path /workspace/abc/3090/engine.pt2   # 4.3 GB; 30-40 s startup
 ```
+
+An older `.bin` engine path (a `torch.compile` cache) is read as the `.pt2` beside it.
 
 `GET /status` reports `"policy": "ready"` when it's done. Then:
 
@@ -218,7 +254,7 @@ run stops as with `/stop`, and `/status` reports why under `last_stop`.
    `runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404` and at least 30 GB of
    container disk. To reuse a compiled engine across pods, attach a
    [global volume](https://docs.runpod.io/storage/globalvolume/overview): it mounts
-   at `/workspace` and holds `abc/3090/engine.bin`. Global volumes can only be
+   at `/workspace` and holds `abc/<gpu>/engine.pt2`. Global volumes can only be
    attached from the console for now, not from the API or `runpodctl`. Keep the
    default `8888/http` port, which RunPod serves at
    `https://<pod-id>-8888.proxy.runpod.net`. Adding a port later restarts the pod
@@ -237,13 +273,14 @@ run stops as with `/stop`, and `/status` reports why under `last_stop`.
    ```
 
 3. Serve on 8888 in place of Jupyter. The first run on a new GPU type compiles
-   for about 13 minutes and writes the engine; later pods load it in about 2:
+   for about 7-13 minutes and writes the engine; later pods load it in under a
+   minute, and don't need the checkpoint once the engine exists:
 
    ```bash
    pkill -f jupyter-lab
    setsid nohup uv run deploy/adamo_server.py \
        --policy.checkpoint-path=/root/cache/bottles_75k.pt \
-       --engine-path /workspace/abc/3090/engine.bin --port 8888 \
+       --engine-path /workspace/abc/3090/engine.pt2 --port 8888 \
        > /root/server.log 2>&1 < /dev/null &
    ```
 
