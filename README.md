@@ -300,3 +300,61 @@ in the server's environment. To keep the server private, leave it on port 8000
 and forward the port over the pod's direct SSH (the `ssh.runpod.io` proxy doesn't
 forward ports):
 `ssh -N -L 8000:localhost:8000 root@<pod-ip> -p <pod-ssh-port>`.
+
+#### On Modal
+
+`deploy/modal_app.py` serves the same app on a [Modal](https://modal.com) GPU
+(L40S by default) at `https://<workspace>--abc-adamo-serve.modal.run`, with the
+same routes. It scales to zero, so you pay only while a container is up:
+
+- Any request wakes it. A cold start loads the engine from the `abc-cache` Modal
+  Volume, and `/status` reports `ready` 1-1.5 minutes after the first request.
+  The first start on a new GPU type builds the engine (about 4 minutes on an L40S).
+- The container stops 3 minutes after the last request, unless the policy is still
+  loading or a run is active. A run sends no HTTP traffic, which Modal would read
+  as idle, so the container requests its own `/status` every 30 s during one to
+  stay up.
+
+1. Install the CLI and log in: `pip install modal && modal setup`.
+
+2. Every adamo 1.0.x on PyPI is yanked, so build a wheel with the adamo repo's
+   `scripts/build-python-wheel.sh` and point `ADAMO_WHEEL` at it for every
+   `modal run` and `modal deploy`. The image is Ubuntu 24.04, which has the
+   glibc 2.38 that its `manylinux_2_38` tag needs:
+
+   ```bash
+   export ADAMO_WHEEL=~/adamo/target/wheels/adamo-1.0.6-cp38-abi3-manylinux_2_38_x86_64.whl
+   ```
+
+3. Download the checkpoint into the volume once, on a CPU container:
+
+   ```bash
+   modal run deploy/modal_app.py::prepare
+   ```
+
+4. Deploy. Deploy-time settings: `ABC_GPU` (default `L40S`), `ABC_REGION`
+   (default `us`; `us-west` is closer to the Bay Area but has less capacity, and
+   Modal bills pinned regions at a multiple of its base price) and
+   `ABC_PROXY_AUTH=1`, covered below.
+
+   ```bash
+   modal deploy deploy/modal_app.py
+   ```
+
+5. Wait for `ready`, then start, run and stop:
+
+   ```bash
+   U=https://<workspace>--abc-adamo-serve.modal.run
+   until curl -s $U/status | grep -q '"policy":"ready"'; do sleep 5; done
+   curl $U/start -H 'content-type: application/json' \
+       -d '{"adamo_api_key": "'$ADAMO_API_KEY'", "robot_name": "abc-sim"}'
+   curl -X POST $U/stop
+   ```
+
+   `modal container list` shows whether a container is up without waking one.
+   `modal app stop abc-adamo` takes the endpoint down.
+
+The URL has no authentication either. `ABC_PROXY_AUTH=1` makes every request
+carry a Modal proxy auth token (`-H "Modal-Key: ..." -H "Modal-Secret: ..."`),
+but the self-requests can't send one, so with it the container stops 3 minutes
+after the last request even mid-run.
