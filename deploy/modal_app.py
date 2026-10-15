@@ -9,9 +9,9 @@ The checkpoint and the per-GPU AOT engine live on the ``abc-cache`` Modal
 Volume, so only the first start on a GPU type builds the engine (7-13 min);
 later starts load it in under a minute.
 
-    # Every adamo 1.0.x on PyPI is yanked: point ADAMO_WHEEL at a wheel built
-    # with the adamo repo's scripts/build-python-wheel.sh.
-    export ADAMO_WHEEL=~/workspace/adamo/target/wheels/adamo-1.0.6-cp38-abi3-manylinux_2_38_x86_64.whl
+    # Optional: serve a local adamo build (scripts/build-python-wheel.sh in the
+    # adamo repo) in place of PyPI's; it is installed over whatever resolves.
+    export ADAMO_WHEEL=~/workspace/adamo/target/wheels/adamo-1.0.9-cp38-abi3-manylinux_2_38_x86_64.whl
     modal run deploy/modal_app.py::prepare     # once: checkpoint -> abc-cache volume
     modal deploy deploy/modal_app.py           # serve; bills only while a container is up
     modal app stop abc-adamo                   # take the endpoint down
@@ -81,6 +81,12 @@ image = (
     image.add_local_file(repo_root / "pyproject.toml", "/build/pyproject.toml", copy=True)
     .add_local_file(repo_root / "README.md", "/build/README.md", copy=True)
     .run_commands(f"cd /build && uv sync --extra adamo --no-install-project --python /usr/local/bin/python")
+    # The resolver can pick PyPI's adamo over an ADAMO_WHEEL of the same
+    # version; install the given wheel over whatever it chose.
+    .run_commands(
+        "for w in /wheels/*.whl; do [ -e \"$w\" ] || continue; "
+        f"uv pip install --python {VENV}/bin/python --reinstall --no-deps \"$w\" || exit 1; done"
+    )
     .env({"PYTHONPATH": REPO, "ABC_CACHE": CACHE})
     .add_local_dir(
         repo_root,
