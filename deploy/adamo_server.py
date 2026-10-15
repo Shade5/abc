@@ -8,6 +8,8 @@ with an Adamo API key and robot name then:
 - subscribes to the robot's joint state on ``{robot}/proprioception/joints``,
 - claims the robot the way operate.adamohq.com does (``take_control``:
   acquired, then a heartbeat a second on ``{robot}/control/json/operator_control``),
+  and holds ``{robot}/operator/active/policy/{session}`` while it drives, so the
+  operate page shows the policy in control and the data service records it,
 - runs an RTC inference loop on the latest observation and publishes one
   action per control tick on the robot's control topic.
 
@@ -226,11 +228,15 @@ class AdamoRun:
         # then a heartbeat every second, then released, on
         # {robot}/control/json/operator_control.
         self.operator = {
-            "userId": "abc-dit-policy",
+            # The operate page labels the holder by this, and the data service
+            # files time under a "policy" holder as the policy's.
+            "userId": "policy",
             "sessionId": uuid.uuid4().hex,
             "displayName": "ABC-DiT policy",
         }
         self.in_control = False
+        self._announcement = None  # operator/active token held while in control
+        self._announce_lock = threading.Lock()
         self.controller: dict | None = None  # the other operator holding the robot
         self._controller_seen = 0.0
         ownership_topic = f"{self.robot}/control/json/operator_control"
@@ -382,6 +388,31 @@ class AdamoRun:
             self.in_control = in_control
             self._chunk = None
             self._generation += 1
+        self._announce_control(in_control)
+
+    def _announce_control(self, in_control: bool) -> None:
+        """Hold or withdraw the {robot}/operator/active/policy/{session} token, from
+        which the operate page shows the holder and the data service decides
+        what to record; neither reads operator_control for this."""
+        with self._announce_lock:
+            if in_control and self._announcement is None:
+                try:
+                    self._announcement = self.session.announce_control(
+                        self.robot, self.operator["userId"], self.operator["sessionId"]
+                    )
+                except Exception as e:
+                    # The policy still drives; only the page's label and recording are missing.
+                    logger.exception("could not announce control")
+                    self.error = (
+                        "the operate page will not show the policy in control and the data "
+                        f"service will not record this run as the policy's: {e}"
+                    )
+            elif not in_control and self._announcement is not None:
+                announcement, self._announcement = self._announcement, None
+                try:
+                    announcement.close()
+                except Exception:
+                    logger.exception("could not withdraw the control announcement")
 
     def _heartbeat_loop(self) -> None:
         while not self.stop_event.wait(HEARTBEAT_S):
